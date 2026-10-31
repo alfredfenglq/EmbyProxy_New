@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  APP_NAME: embyproxy
+  APP_NAME: embyproxy_new
   REGISTRY: ghcr.io
 
 jobs:
@@ -31,30 +31,9 @@ jobs:
             goarch: "386"
             extension: .exe
             archive: zip
-          - name: windows-arm64
-            goos: windows
-            goarch: arm64
-            extension: .exe
-            archive: zip
           - name: linux-x64
             goos: linux
             goarch: amd64
-            extension: ""
-            archive: tar.gz
-          - name: linux-x86
-            goos: linux
-            goarch: "386"
-            extension: ""
-            archive: tar.gz
-          - name: linux-arm64
-            goos: linux
-            goarch: arm64
-            extension: ""
-            archive: tar.gz
-          - name: linux-armv7
-            goos: linux
-            goarch: arm
-            goarm: "7"
             extension: ""
             archive: tar.gz
 
@@ -145,7 +124,7 @@ jobs:
       - name: Normalize image name
         id: image
         shell: bash
-        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}/embyproxy" >> "$GITHUB_OUTPUT"
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}/embyproxy_new" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
