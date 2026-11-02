@@ -23,7 +23,7 @@ EmbyProxy 是一个用于管理和转发 Emby 节点请求的代理程序，提�
 
 打开 Release 页面下载对应系统的压缩包：
 
-[https://github.com/hkfires/EmbyProxy/releases/latest](https://github.com/hkfires/EmbyProxy/releases/latest)
+[https://github.com/alfredfenglq/EmbyProxy_New/releases/latest](https://github.com/alfredfenglq/EmbyProxy_New/releases/latest)
 
 可用文件：
 
@@ -31,11 +31,7 @@ EmbyProxy 是一个用于管理和转发 Emby 节点请求的代理程序，提�
 | --- | --- | --- |
 | Windows | x64 | `embyproxy-windows-x64.zip` |
 | Windows | x86 | `embyproxy-windows-x86.zip` |
-| Windows | ARM64 | `embyproxy-windows-arm64.zip` |
 | Linux | x64 | `embyproxy-linux-x64.tar.gz` |
-| Linux | x86 | `embyproxy-linux-x86.tar.gz` |
-| Linux | ARM64 | `embyproxy-linux-arm64.tar.gz` |
-| Linux | ARMv7 | `embyproxy-linux-armv7.tar.gz` |
 
 压缩包内包含程序文件和 `.env.example` 配置模板。解压后先复制一份配置文件：
 
@@ -61,13 +57,13 @@ embyproxy --version
 
 Docker Compose 部署只需要下载 `compose.yml` 和 `.env.example`，并将两个文件放在同一个目录下：
 
-- [`compose.yml`](https://raw.githubusercontent.com/hkfires/EmbyProxy/main/compose.yml)
-- [`.env.example`](https://raw.githubusercontent.com/hkfires/EmbyProxy/main/.env.example)
+- [`compose.yml`](https://raw.githubusercontent.com/alfredfenglq/EmbyProxy_New/main/compose.yml)
+- [`.env.example`](https://raw.githubusercontent.com/alfredfenglq/EmbyProxy_New/main/.env.example)
 
 `compose.yml` 默认使用远程镜像：
 
 ```yaml
-image: ghcr.io/hkfires/embyproxy:latest
+image: ghcr.io/alfredfenglq/embyproxy_new:latest
 ```
 
 使用前先将 `.env.example` 复制为 `.env`，然后用文本编辑器打开 `.env`。
