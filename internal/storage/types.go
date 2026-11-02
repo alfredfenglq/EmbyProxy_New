@@ -90,6 +90,7 @@ func DefaultSystemConfig() SystemConfig {
 type PlayStat struct {
 	Day            string `json:"day"`
 	Node           string `json:"node"`
+	Server         string `json:"server"`
 	Client         string `json:"client"`
 	Plays          int64  `json:"plays"`
 	PlaybackMillis int64  `json:"playbackMillis"`

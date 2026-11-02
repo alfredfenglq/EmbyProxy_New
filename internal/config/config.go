@@ -70,6 +70,14 @@ func Load() (Config, error) {
 			ProgressThrottleMS: 1200,
 		},
 	}
+	// envString returns the raw value when INSTANCE_NAME is set, including
+	// whitespace-only. Trim first so the scheduler heartbeat and the stats
+	// server name use the same string; an empty result falls back to the
+	// hostname instead of merging every such instance onto one key.
+	cfg.InstanceName = strings.TrimSpace(cfg.InstanceName)
+	if cfg.InstanceName == "" {
+		cfg.InstanceName = hostname
+	}
 	return cfg, nil
 }
 

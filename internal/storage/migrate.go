@@ -24,8 +24,8 @@ var migrateTables = []migrateTable{
 	{name: "keepalive_state", columns: []string{"node", "anchor_ts", "last_play_ts", "last_notify_day", "notify_count_day", "notify_count"}, pk: []string{"node"}},
 	{name: "play_sessions", columns: []string{"k", "day", "last_ts"}, pk: []string{"k"}},
 	{name: "play_events", columns: []string{"k", "day", "last_ts"}, pk: []string{"k"}},
-	{name: "playback_states", columns: []string{"k", "node", "client", "mode", "item_key", "last_event_ts", "last_position_ticks", "has_position", "is_paused", "closed", "updated_at"}, pk: []string{"k"}},
-	{name: "play_stats", columns: []string{"day", "node", "client", "plays", "playback_ms", "bytes", "inbound_bytes", "outbound_bytes", "sessions", "errors", "updated_at"}, pk: []string{"day", "node", "client"}},
+	{name: "playback_states", columns: []string{"k", "node", "client", "server", "mode", "item_key", "last_event_ts", "last_position_ticks", "has_position", "is_paused", "closed", "updated_at"}, pk: []string{"k"}},
+	{name: "play_stats", columns: []string{"day", "node", "client", "server", "plays", "playback_ms", "bytes", "inbound_bytes", "outbound_bytes", "sessions", "errors", "updated_at"}, pk: []string{"day", "node", "client", "server"}},
 	{name: "play_buckets", columns: []string{"bucket_start", "node", "client", "mode", "plays", "playback_ms", "bytes", "inbound_bytes", "outbound_bytes", "sessions", "errors", "updated_at"}, pk: []string{"bucket_start", "node", "client", "mode"}},
 }
 

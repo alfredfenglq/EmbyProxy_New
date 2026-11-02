@@ -179,7 +179,7 @@ main{min-width:0;min-height:0}
 .stat-block .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.14em;font-weight:950;color:var(--ink-3)}
 .data-table{background:var(--paper);border:1px solid rgba(255,253,248,.88);border-radius:30px;overflow:auto;box-shadow:0 18px 56px rgba(58,48,32,.08)}
 table{width:100%;border-collapse:collapse}
-#statsTable{min-width:1320px}
+#statsTable{min-width:1440px}
 th,td{padding:15px 18px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
 th{background:var(--paper-2);color:var(--ink-3);font-size:11px;text-transform:uppercase;letter-spacing:.14em;font-weight:950}
 td{color:var(--ink-2)}
@@ -586,6 +586,7 @@ tr:last-child td{border-bottom:0}
               <thead><tr>
                 <th data-stats-sort="day" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('day')"><span>日期</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="lastActivityAt" aria-sort="descending"><button type="button" class="stats-sort-button" onclick="setStatsSort('lastActivityAt')"><span>最近活动</span><span class="stats-sort-indicator" aria-hidden="true">▼</span></button></th>
+                <th data-stats-sort="server" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('server')"><span>后端节点</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="node" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('node')"><span>Emby 节点</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="client" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('client')"><span>客户端</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="plays" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('plays')"><span>播放次数</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
@@ -1258,6 +1259,7 @@ const LOG_STREAM_WATCHDOG_MS = 45000;
 const STATS_SORT_DEFAULT_DIRECTIONS = {
   day: 'desc',
   lastActivityAt: 'desc',
+  server: 'asc',
   node: 'asc',
   client: 'asc',
   plays: 'desc',
@@ -1269,6 +1271,7 @@ const STATS_SORT_DEFAULT_DIRECTIONS = {
 const STATS_SORT_FALLBACKS = [
   ['day', 'desc'],
   ['lastActivityAt', 'desc'],
+  ['server', 'asc'],
   ['node', 'asc'],
   ['client', 'asc'],
 ];
@@ -2780,8 +2783,8 @@ function renderStatsTable() {
   const stats = sortedStatsRows();
   const tbody = document.getElementById('statsBody');
   tbody.innerHTML = stats.length ? stats.map(s => `
-    <tr><td>${esc(s.day)}</td><td>${esc(formatStatsActivity(s))}</td><td>${esc(s.node)}</td><td>${esc(s.client)}</td><td>${s.plays}</td><td>${s.sessions}</td><td>${formatPlaybackDuration(statsPlaybackMillis(s))}</td><td>${formatBytes(trafficInboundBytes(s))}</td><td>${formatBytes(trafficOutboundBytes(s))}</td></tr>
-  `).join('') : '<tr><td class="table-empty" colspan="9">暂无数据</td></tr>';
+    <tr><td>${esc(s.day)}</td><td>${esc(formatStatsActivity(s))}</td><td>${esc(s.server || '-')}</td><td>${esc(s.node)}</td><td>${esc(s.client)}</td><td>${s.plays}</td><td>${s.sessions}</td><td>${formatPlaybackDuration(statsPlaybackMillis(s))}</td><td>${formatBytes(trafficInboundBytes(s))}</td><td>${formatBytes(trafficOutboundBytes(s))}</td></tr>
+  `).join('') : '<tr><td class="table-empty" colspan="10">暂无数据</td></tr>';
   updateStatsSortHeaders();
 }
 
@@ -2799,7 +2802,7 @@ function sortedStatsRows() {
 }
 
 function compareStatsField(left, right, key) {
-  if (key === 'day' || key === 'node' || key === 'client') {
+  if (key === 'day' || key === 'node' || key === 'server' || key === 'client') {
     return statsTextCollator.compare(String(left?.[key] || ''), String(right?.[key] || ''));
   }
   if (key === 'playbackMillis') return compareStatsNumber(statsPlaybackMillis(left), statsPlaybackMillis(right));

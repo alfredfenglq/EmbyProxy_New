@@ -37,6 +37,15 @@ type Store struct {
 	playbackQueue     chan PlaybackInput
 	playbackWG        sync.WaitGroup
 	playbackDropped   uint64
+	// serverName is this EmbyProxy instance's name (INSTANCE_NAME, e.g. A/B/C).
+	// It is recorded in play_stats so the admin stats table can show which
+	// server served each playback. Set once at startup via SetServerName.
+	serverMu   sync.RWMutex
+	serverName string
+	// playStatsServerMigrated is set when this startup migrated an existing
+	// play_stats table to the (day, node, client, server) primary key.
+	// Fresh tables already have the new key, so they do not set it.
+	playStatsServerMigrated bool
 }
 
 type KV struct {
@@ -162,6 +171,43 @@ func (s *Store) KV() *KV {
 	return &KV{store: s}
 }
 
+// SetServerName records this instance's name for playback statistics.
+// Call once at startup, before serving traffic; config.Load already
+// trims INSTANCE_NAME and falls back to the hostname when empty.
+func (s *Store) SetServerName(name string) {
+	if s == nil {
+		return
+	}
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+	s.serverName = strings.TrimSpace(name)
+}
+
+// ServerName returns the name set by SetServerName, or "" if unset.
+func (s *Store) ServerName() string {
+	if s == nil {
+		return ""
+	}
+	s.serverMu.RLock()
+	defer s.serverMu.RUnlock()
+	return s.serverName
+}
+
+// PlayStatsServerMigrated reports whether this startup migrated an existing
+// play_stats table to the server key. Callers use it to warn that every
+// instance sharing the database must run the new binary: old binaries'
+// play_stats upserts name the old primary key and fail on PostgreSQL once
+// the key has changed (SQLSTATE 42P10), and the async stats writer drops
+// those errors silently, so a rolling upgrade would lose statistics.
+func (s *Store) PlayStatsServerMigrated() bool {
+	if s == nil {
+		return false
+	}
+	s.serverMu.RLock()
+	defer s.serverMu.RUnlock()
+	return s.playStatsServerMigrated
+}
+
 func (s *Store) InitSchema(ctx context.Context) error {
 	schema := sqliteSchema
 	if s.pg {
@@ -175,7 +221,10 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return s.ensurePlaybackStatColumns(ctx)
+	if err := s.ensurePlaybackStatColumns(ctx); err != nil {
+		return err
+	}
+	return s.ensurePlayStatsServerColumn(ctx)
 }
 
 // sqliteSchema is the single source for the table definitions. The
@@ -209,6 +258,7 @@ const sqliteSchema = `
 			k TEXT PRIMARY KEY,
 			node TEXT NOT NULL,
 			client TEXT NOT NULL,
+			server TEXT NOT NULL DEFAULT '',
 			mode TEXT NOT NULL,
 			item_key TEXT NOT NULL,
 			last_event_ts INTEGER NOT NULL,
@@ -223,6 +273,7 @@ const sqliteSchema = `
 			day TEXT NOT NULL,
 			node TEXT NOT NULL,
 			client TEXT NOT NULL,
+			server TEXT NOT NULL DEFAULT '',
 			plays INTEGER DEFAULT 0,
 			playback_ms INTEGER DEFAULT 0,
 			bytes INTEGER DEFAULT 0,
@@ -231,7 +282,7 @@ const sqliteSchema = `
 			sessions INTEGER DEFAULT 0,
 			errors INTEGER DEFAULT 0,
 			updated_at INTEGER NOT NULL,
-			PRIMARY KEY(day, node, client)
+			PRIMARY KEY(day, node, client, server)
 		);
 		CREATE TABLE IF NOT EXISTS play_buckets (
 			bucket_start INTEGER NOT NULL,
@@ -262,6 +313,7 @@ func (s *Store) ensurePlaybackStatColumns(ctx context.Context) error {
 		},
 		"playback_states": {
 			"closed INTEGER DEFAULT 0",
+			"server TEXT DEFAULT ''",
 		},
 	} {
 		cols, err := s.tableColumns(ctx, table)
@@ -276,7 +328,16 @@ func (s *Store) ensurePlaybackStatColumns(ctx context.Context) error {
 			if cols[name] {
 				continue
 			}
-			if _, err := s.dbx().ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column); err != nil {
+			// PostgreSQL uses IF NOT EXISTS so concurrent startups do
+			// not race on the check-then-add: the second ADD is a no-op
+			// instead of failing the whole startup. SQLite has no such
+			// clause and runs one process per file, so it keeps the
+			// check-then-add.
+			stmt := `ALTER TABLE ` + table + ` ADD COLUMN ` + column
+			if s.pg {
+				stmt = `ALTER TABLE ` + table + ` ADD COLUMN IF NOT EXISTS ` + column
+			}
+			if _, err := s.dbx().ExecContext(ctx, stmt); err != nil {
 				return err
 			}
 		}
@@ -284,14 +345,205 @@ func (s *Store) ensurePlaybackStatColumns(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+func (s *Store) ensurePlayStatsServerColumn(ctx context.Context) error {
 	if s.pg {
+		return s.ensurePlayStatsServerColumnPG(ctx)
+	}
+	cols, err := s.tableColumns(ctx, "play_stats")
+	if err != nil {
+		return err
+	}
+	if !cols["server"] {
+		if _, err := s.dbx().ExecContext(ctx, `ALTER TABLE play_stats ADD COLUMN server TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+		s.setPlayStatsServerMigrated()
+	}
+	hasServerInPK, err := s.playStatsPKHasServer(ctx)
+	if err != nil {
+		return err
+	}
+	if hasServerInPK {
+		return nil
+	}
+	// Tables created before the server column existed still have the old
+	// PRIMARY KEY(day, node, client); rows from different servers would
+	// collapse into one row on upsert. Old rows keep server '' (shown as
+	// '-' in the admin table); only their key changes, no data is lost.
+	// SQLite cannot alter a primary key, so rebuild the table: the new
+	// table has the same columns plus server, keyed by
+	// (day, node, client, server). This runs after
+	// ensurePlaybackStatColumns, so every column in the SELECT exists.
+	// COALESCE preserves server values if a previous startup already wrote
+	// them but was interrupted before the key change; a constant '' here
+	// would wipe A/B/C back to empty on the next rebuild.
+	tx, err := s.dbx().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`CREATE TABLE play_stats_new (
+			day TEXT NOT NULL,
+			node TEXT NOT NULL,
+			client TEXT NOT NULL,
+			server TEXT NOT NULL DEFAULT '',
+			plays INTEGER DEFAULT 0,
+			playback_ms INTEGER DEFAULT 0,
+			bytes INTEGER DEFAULT 0,
+			inbound_bytes INTEGER DEFAULT 0,
+			outbound_bytes INTEGER DEFAULT 0,
+			sessions INTEGER DEFAULT 0,
+			errors INTEGER DEFAULT 0,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY(day, node, client, server)
+		)`,
+		`INSERT INTO play_stats_new (day, node, client, server, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at)
+			SELECT day, node, client, COALESCE(server, ''), plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at FROM play_stats`,
+		`DROP TABLE play_stats`,
+		`ALTER TABLE play_stats_new RENAME TO play_stats`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.setPlayStatsServerMigrated()
+	return nil
+}
+
+// ensurePlayStatsServerColumnPG is the PostgreSQL half of the play_stats
+// server migration. The whole migration runs in one transaction behind a
+// transaction-scoped advisory lock, so concurrent startups serialize
+// instead of racing on ADD COLUMN / DROP CONSTRAINT, and a failure anywhere
+// leaves the old primary key intact instead of a table with no key at all.
+// The primary key constraint name is looked up, not assumed: a table whose
+// key is not literally named play_stats_pkey would otherwise leave DROP
+// as a no-op and fail ADD PRIMARY KEY with "multiple primary keys".
+func (s *Store) ensurePlayStatsServerColumnPG(ctx context.Context) error {
+	tx, err := s.dbx().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('embyproxy_play_stats_server'))`); err != nil {
+		return err
+	}
+	cols, err := tableColumnsWith(ctx, tx, true, "play_stats")
+	if err != nil {
+		return err
+	}
+	migrated := false
+	if !cols["server"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE play_stats ADD COLUMN IF NOT EXISTS server TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+		migrated = true
+	}
+	hasServerInPK, err := playStatsPKHasServerWith(ctx, tx, true)
+	if err != nil {
+		return err
+	}
+	if !hasServerInPK {
+		var pkName string
+		err := tx.QueryRowContext(ctx, `SELECT conname FROM pg_constraint WHERE conrelid = 'play_stats'::regclass AND contype = 'p'`).Scan(&pkName)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// No primary key at all (e.g. a previous non-transactional
+		// migration was killed between DROP and ADD): skip the DROP
+		// and just add the new key.
+		if err == nil {
+			quoted := `"` + strings.ReplaceAll(pkName, `"`, `""`) + `"`
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE play_stats DROP CONSTRAINT `+quoted); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE play_stats ADD PRIMARY KEY (day, node, client, server)`); err != nil {
+			return err
+		}
+		migrated = true
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if migrated {
+		s.setPlayStatsServerMigrated()
+	}
+	return nil
+}
+
+// playStatsPKHasServer reports whether server is part of play_stats'
+// primary key.
+func (s *Store) playStatsPKHasServer(ctx context.Context) (bool, error) {
+	return playStatsPKHasServerWith(ctx, s.dbx(), s.pg)
+}
+
+func playStatsPKHasServerWith(ctx context.Context, q dbQuerier, pg bool) (bool, error) {
+	if pg {
+		rows, err := q.QueryContext(ctx, `SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'play_stats'::regclass AND i.indisprimary`)
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return false, err
+			}
+			if name == "server" {
+				return true, nil
+			}
+		}
+		return false, rows.Err()
+	}
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(play_stats)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == "server" && pk > 0 {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// dbQuerier is satisfied by both dialectDB and dialectTx, so schema checks
+// can run either standalone or inside a migration transaction.
+type dbQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (s *Store) setPlayStatsServerMigrated() {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+	s.playStatsServerMigrated = true
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	return tableColumnsWith(ctx, s.dbx(), s.pg, table)
+}
+
+func tableColumnsWith(ctx context.Context, q dbQuerier, pg bool, table string) (map[string]bool, error) {
+	if pg {
 		// information_schema.columns is the PostgreSQL equivalent of
 		// PRAGMA table_info. The query goes through dbx() so its "?"
 		// placeholder is rewritten to "$1". No schema filter: the check
 		// only needs column existence, and the tables are created by
 		// this program in the connection's default schema.
-		rows, err := s.dbx().QueryContext(ctx, `SELECT column_name FROM information_schema.columns WHERE table_name = ?`, table)
+		rows, err := q.QueryContext(ctx, `SELECT column_name FROM information_schema.columns WHERE table_name = ?`, table)
 		if err != nil {
 			return nil, err
 		}
@@ -306,7 +558,7 @@ func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool
 		}
 		return cols, rows.Err()
 	}
-	rows, err := s.dbx().QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return nil, err
 	}

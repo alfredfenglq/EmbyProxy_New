@@ -114,3 +114,59 @@ func TestMigrateSQLiteToPostgres(t *testing.T) {
 		t.Fatalf("migrated KV.Get() = %q, %v, %v", value, ok, err)
 	}
 }
+
+func TestPostgresPlayStatsServerUpgrade(t *testing.T) {
+	dsn := postgresTestDSN(t)
+	ctx := context.Background()
+	store, err := NewWithDatabaseURL("", dsn)
+	if err != nil {
+		t.Fatalf("NewWithDatabaseURL() error = %v", err)
+	}
+	defer func() {
+		dropPostgresTestTables(t, store)
+		_ = store.Close()
+	}()
+
+	// Replace the current table with the pre-server schema and one old row.
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE IF EXISTS play_stats`); err != nil {
+		t.Fatalf("drop play_stats error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE play_stats (
+		day TEXT NOT NULL, node TEXT NOT NULL, client TEXT NOT NULL,
+		plays BIGINT DEFAULT 0, playback_ms BIGINT DEFAULT 0,
+		bytes BIGINT DEFAULT 0, inbound_bytes BIGINT DEFAULT 0,
+		outbound_bytes BIGINT DEFAULT 0, sessions BIGINT DEFAULT 0,
+		errors BIGINT DEFAULT 0, updated_at BIGINT NOT NULL,
+		CONSTRAINT play_stats_old_pk PRIMARY KEY(day, node, client)
+	)`); err != nil {
+		t.Fatalf("create old play_stats error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO play_stats (day, node, client, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES ('2026-01-02', 'alpha', 'c', 3, 60000, 7000, 1000, 6000, 2, 0, 100)`); err != nil {
+		t.Fatalf("seed old play_stats error = %v", err)
+	}
+
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+
+	var plays int64
+	var server string
+	if err := store.db.QueryRowContext(ctx, `SELECT plays, server FROM play_stats WHERE day = '2026-01-02'`).Scan(&plays, &server); err != nil {
+		t.Fatalf("read upgraded play_stats error = %v", err)
+	}
+	if plays != 3 || server != "" {
+		t.Fatalf("upgraded old row = plays %d server %q, want 3 and empty", plays, server)
+	}
+	for _, srv := range []string{"A", "B"} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO play_stats (day, node, client, server, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES ('2026-01-02', 'alpha', 'c', $1, 1, 0, 0, 0, 0, 0, 0, 101)`, srv); err != nil {
+			t.Fatalf("insert server %s error = %v", srv, err)
+		}
+	}
+	var count int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM play_stats WHERE day = '2026-01-02' AND node = 'alpha' AND client = 'c'`).Scan(&count); err != nil {
+		t.Fatalf("count play_stats error = %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("play_stats rows = %d, want 3 (old '' + A + B)", count)
+	}
+}

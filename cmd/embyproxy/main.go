@@ -61,6 +61,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	// The instance name doubles as the server recorded in playback
+	// statistics, so the admin stats table can show which server (A/B/C)
+	// served each playback. No new configuration is needed: it reuses the
+	// INSTANCE_NAME already used for notification sender election.
+	store.SetServerName(cfg.InstanceName)
+	// PostgreSQL only: a single-machine SQLite file has no second
+	// instance to break, so it does not get this multi-machine warning.
+	if store.PlayStatsServerMigrated() && store.IsPG() {
+		log.Warn("startup", "play_stats primary key migrated to include server; upgrade all instances sharing this database to the new binary before serving traffic: old binaries fail play_stats writes once the key has changed", map[string]any{"event": "playStatsServerMigrated"})
+	}
 	applyRuntimeConfig(context.Background(), store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -141,8 +151,12 @@ func databaseLabel(cfg config.Config) string {
 // runSQLiteToPGMigration implements `embyproxy migrate-sqlite-to-pg`. It
 // copies every state table from the SQLite file at cfg.DBPath into the
 // PostgreSQL database at cfg.DATABASE_URL, then prints the per-table row
-// counts. The source file is only read, never modified or deleted, and the
-// copy is idempotent, so the command is safe to re-run. It deliberately
+// counts. The source is always SQLite; the PostgreSQL primary key is
+// migrated when the destination is opened with NewWithDatabaseURL, not
+// by this command. Opening the source runs the usual schema upgrade
+// (adds columns, may rebuild play_stats), so back up the source file
+// yourself before running this. The copy itself is idempotent, so the
+// command is safe to re-run. It deliberately
 // runs before the ADMIN_TOKEN check: migration is a database operation,
 // not serving traffic. Exit code 1 on any failure.
 func runSQLiteToPGMigration(cfg config.Config) {
@@ -183,7 +197,7 @@ func runSQLiteToPGMigration(cfg config.Config) {
 	for _, table := range []string{"proxy_kv", "keepalive_state", "play_sessions", "play_events", "playback_states", "play_stats", "play_buckets"} {
 		fmt.Printf("%s: %d rows\n", table, counts[table])
 	}
-	fmt.Println("migrate-sqlite-to-pg: done, source database left untouched")
+	fmt.Println("migrate-sqlite-to-pg: done, source schema upgraded on open")
 }
 
 func logBuildInfo(log *logging.Logger) {

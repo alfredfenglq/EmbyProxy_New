@@ -446,7 +446,7 @@ func TestAddPlaybackDurationAggregatesDailyWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
-	if err := addPlaybackDuration(ctx, tx, start, end, "alpha", "aggregate-client", "proxy"); err != nil {
+	if err := addPlaybackDuration(ctx, tx, start, end, "alpha", "aggregate-client", "proxy", "A"); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("addPlaybackDuration() error = %v", err)
 	}
@@ -1441,5 +1441,371 @@ func TestPrunePlaybackStatesRemovesOnlyExpiredRows(t *testing.T) {
 	}
 	if keys != "active" {
 		t.Fatalf("remaining playback state keys = %q, want active", keys)
+	}
+}
+
+func TestPlayStatsServerDimension(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+
+	headers := http.Header{
+		"User-Agent":        {"test-client"},
+		"X-Emby-Device-Id":  {"device-1"},
+		"X-Emby-Session-Id": {"session-1"},
+	}
+	input := PlaybackInput{
+		Node:        Node{Name: "alpha"},
+		RequestIP:   "127.0.0.1",
+		Headers:     headers,
+		Status:      http.StatusNoContent,
+		IsPlayback:  true,
+		Mode:        "proxy",
+		RequestURL:  "/emby/Sessions/Playing",
+		Method:      http.MethodPost,
+		RequestBody: []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1"}`),
+	}
+
+	store.SetServerName("A")
+	if err := store.LogPlayback(ctx, input); err != nil {
+		t.Fatalf("LogPlayback() server A error = %v", err)
+	}
+	inputB := input
+	inputB.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-2"}`)
+	store.SetServerName("B")
+	if err := store.LogPlayback(ctx, inputB); err != nil {
+		t.Fatalf("LogPlayback() server B error = %v", err)
+	}
+
+	stats, err := store.GetPlayStats(ctx, 7)
+	if err != nil {
+		t.Fatalf("GetPlayStats() error = %v", err)
+	}
+	byServer := map[string]int64{}
+	for _, s := range stats {
+		if s.Node == "alpha" {
+			byServer[s.Server] += s.Plays
+		}
+	}
+	if byServer["A"] != 1 || byServer["B"] != 1 {
+		t.Fatalf("plays by server = %v, want A:1 B:1", byServer)
+	}
+
+	// Traffic uses the same (day, node, client, server) key: bytes must
+	// land on the row of the server that actually served the stream.
+	traffic := PlaybackInput{
+		Node:          Node{Name: "alpha"},
+		RequestIP:     "127.0.0.1",
+		Headers:       headers,
+		Status:        http.StatusOK,
+		IsPlayback:    true,
+		Mode:          "proxy",
+		RequestURL:    "/emby/Videos/1/stream",
+		Method:        http.MethodGet,
+		InboundBytes:  100,
+		OutboundBytes: 200,
+	}
+	store.SetServerName("A")
+	if err := store.LogPlaybackTraffic(ctx, traffic); err != nil {
+		t.Fatalf("LogPlaybackTraffic() server A error = %v", err)
+	}
+	traffic.InboundBytes = 300
+	traffic.OutboundBytes = 400
+	store.SetServerName("B")
+	if err := store.LogPlaybackTraffic(ctx, traffic); err != nil {
+		t.Fatalf("LogPlaybackTraffic() server B error = %v", err)
+	}
+	stats, err = store.GetPlayStats(ctx, 7)
+	if err != nil {
+		t.Fatalf("GetPlayStats() error = %v", err)
+	}
+	trafficByServer := map[string][2]int64{}
+	for _, s := range stats {
+		if s.Node == "alpha" {
+			trafficByServer[s.Server] = [2]int64{s.InboundBytes, s.OutboundBytes}
+		}
+	}
+	if trafficByServer["A"] != [2]int64{100, 200} || trafficByServer["B"] != [2]int64{300, 400} {
+		t.Fatalf("traffic by server = %v, want A:[100 200] B:[300 400]", trafficByServer)
+	}
+}
+
+func TestPlayStatsServerUpgradeSQLite(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+
+	// Replace the current table with the pre-server schema and one old row.
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE play_stats`); err != nil {
+		t.Fatalf("drop play_stats error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE play_stats (
+		day TEXT NOT NULL, node TEXT NOT NULL, client TEXT NOT NULL,
+		plays INTEGER DEFAULT 0, playback_ms INTEGER DEFAULT 0,
+		bytes INTEGER DEFAULT 0, inbound_bytes INTEGER DEFAULT 0,
+		outbound_bytes INTEGER DEFAULT 0, sessions INTEGER DEFAULT 0,
+		errors INTEGER DEFAULT 0, updated_at INTEGER NOT NULL,
+		PRIMARY KEY(day, node, client)
+	)`); err != nil {
+		t.Fatalf("create old play_stats error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO play_stats (day, node, client, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES ('2026-01-02', 'alpha', 'c', 3, 60000, 7000, 1000, 6000, 2, 0, 100)`); err != nil {
+		t.Fatalf("seed old play_stats error = %v", err)
+	}
+
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+
+	var plays int64
+	var server string
+	if err := store.db.QueryRowContext(ctx, `SELECT plays, server FROM play_stats WHERE day = '2026-01-02'`).Scan(&plays, &server); err != nil {
+		t.Fatalf("read upgraded play_stats error = %v", err)
+	}
+	if plays != 3 || server != "" {
+		t.Fatalf("upgraded old row = plays %d server %q, want 3 and empty", plays, server)
+	}
+
+	// With the old primary key the second insert would have collapsed into
+	// the first row; with (day, node, client, server) all three coexist.
+	for _, srv := range []string{"A", "B"} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO play_stats (day, node, client, server, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES ('2026-01-02', 'alpha', 'c', ?, 1, 0, 0, 0, 0, 0, 0, 101)`, srv); err != nil {
+			t.Fatalf("insert server %s error = %v", srv, err)
+		}
+	}
+	var count int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM play_stats WHERE day = '2026-01-02' AND node = 'alpha' AND client = 'c'`).Scan(&count); err != nil {
+		t.Fatalf("count play_stats error = %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("play_stats rows = %d, want 3 (old '' + A + B)", count)
+	}
+}
+
+func TestAddPlaybackDurationRecordsServer(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+
+	start := time.Date(2026, 7, 12, 12, 0, 50, 0, localtime.Location()).UnixMilli()
+	end := start + 30_000
+	tx, err := store.dbx().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if err := addPlaybackDuration(ctx, tx, start, end, "alpha", "aggregate-client", "proxy", "A"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("addPlaybackDuration() error = %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+
+	var server string
+	var millis int64
+	if err := store.db.QueryRowContext(ctx, `SELECT server, playback_ms FROM play_stats WHERE node = 'alpha'`).Scan(&server, &millis); err != nil {
+		t.Fatalf("query play_stats error = %v", err)
+	}
+	if server != "A" || millis != 30_000 {
+		t.Fatalf("play_stats = server %q playback_ms %d, want A and 30000", server, millis)
+	}
+}
+
+func TestPlaybackDurationAttributedToStartingServer(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+	t0 := time.Now().UnixMilli()
+
+	headers := http.Header{
+		"User-Agent":        {"test-client"},
+		"X-Emby-Device-Id":  {"device-1"},
+		"X-Emby-Session-Id": {"session-1"},
+	}
+	playing := PlaybackInput{
+		Node:        Node{Name: "alpha"},
+		RequestIP:   "127.0.0.1",
+		Headers:     headers,
+		Status:      http.StatusNoContent,
+		IsPlayback:  true,
+		Mode:        "proxy",
+		RequestURL:  "/emby/Sessions/Playing",
+		Method:      http.MethodPost,
+		OccurredAt:  t0,
+		RequestBody: []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`),
+	}
+	store.SetServerName("A")
+	if err := store.LogPlayback(ctx, playing); err != nil {
+		t.Fatalf("LogPlayback() playing error = %v", err)
+	}
+
+	progress := playing
+	progress.RequestURL = "/emby/Sessions/Playing/Progress"
+	progress.OccurredAt = t0 + 10_000
+	progress.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 100000, "IsPaused": false}`)
+	store.SetServerName("B")
+	if err := store.LogPlayback(ctx, progress); err != nil {
+		t.Fatalf("LogPlayback() progress error = %v", err)
+	}
+
+	stats, err := store.GetPlayStats(ctx, 7)
+	if err != nil {
+		t.Fatalf("GetPlayStats() error = %v", err)
+	}
+	var millisA, millisB, playsA int64
+	for _, s := range stats {
+		if s.Node != "alpha" {
+			continue
+		}
+		if s.Server == "A" {
+			millisA += s.PlaybackMillis
+			playsA += s.Plays
+		}
+		if s.Server == "B" {
+			millisB += s.PlaybackMillis
+		}
+	}
+	if playsA != 1 || millisA != 10_000 || millisB != 0 {
+		t.Fatalf("plays A = %d, duration A = %d, duration B = %d; want 1, 10000, 0", playsA, millisA, millisB)
+	}
+}
+
+func TestPlaybackItemChangeKeepsStartingServer(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+	t0 := time.Now().UnixMilli()
+
+	headers := http.Header{
+		"User-Agent":        {"test-client"},
+		"X-Emby-Device-Id":  {"device-1"},
+		"X-Emby-Session-Id": {"session-1"},
+	}
+	playing := PlaybackInput{
+		Node:        Node{Name: "alpha"},
+		RequestIP:   "127.0.0.1",
+		Headers:     headers,
+		Status:      http.StatusNoContent,
+		IsPlayback:  true,
+		Mode:        "proxy",
+		RequestURL:  "/emby/Sessions/Playing",
+		Method:      http.MethodPost,
+		OccurredAt:  t0,
+		RequestBody: []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`),
+	}
+	store.SetServerName("A")
+	if err := store.LogPlayback(ctx, playing); err != nil {
+		t.Fatalf("LogPlayback() playing error = %v", err)
+	}
+
+	// Same session, different item: the item-change branch rebuilds the
+	// state from the new event. It must keep the starting server; a zero
+	// value here would overwrite it with '' and later progress would be
+	// attributed to whichever instance handles it.
+	change := playing
+	change.RequestURL = "/emby/Sessions/Playing/Progress"
+	change.OccurredAt = t0 + 10_000
+	change.RequestBody = []byte(`{"ItemId": "2", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 100000, "IsPaused": false}`)
+	store.SetServerName("B")
+	if err := store.LogPlayback(ctx, change); err != nil {
+		t.Fatalf("LogPlayback() item change error = %v", err)
+	}
+
+	progress := change
+	progress.OccurredAt = t0 + 20_000
+	progress.RequestBody = []byte(`{"ItemId": "2", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 200000, "IsPaused": false}`)
+	if err := store.LogPlayback(ctx, progress); err != nil {
+		t.Fatalf("LogPlayback() progress error = %v", err)
+	}
+
+	stats, err := store.GetPlayStats(ctx, 7)
+	if err != nil {
+		t.Fatalf("GetPlayStats() error = %v", err)
+	}
+	var millisA, millisB, playsA int64
+	for _, s := range stats {
+		if s.Node != "alpha" {
+			continue
+		}
+		if s.Server == "A" {
+			millisA += s.PlaybackMillis
+			playsA += s.Plays
+		}
+		if s.Server == "B" {
+			millisB += s.PlaybackMillis
+		}
+	}
+	if playsA != 1 || millisA != 10_000 || millisB != 0 {
+		t.Fatalf("plays A = %d, duration A = %d, duration B = %d; want 1, 10000, 0", playsA, millisA, millisB)
+	}
+}
+
+func TestPlaybackReopenAfterStopAdoptsNewServer(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+	t0 := time.Now().UnixMilli()
+
+	headers := http.Header{
+		"User-Agent":        {"test-client"},
+		"X-Emby-Device-Id":  {"device-1"},
+		"X-Emby-Session-Id": {"session-1"},
+	}
+	playing := PlaybackInput{
+		Node:        Node{Name: "alpha"},
+		RequestIP:   "127.0.0.1",
+		Headers:     headers,
+		Status:      http.StatusNoContent,
+		IsPlayback:  true,
+		Mode:        "proxy",
+		RequestURL:  "/emby/Sessions/Playing",
+		Method:      http.MethodPost,
+		OccurredAt:  t0,
+		RequestBody: []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`),
+	}
++	store.SetServerName("A")
+	if err := store.LogPlayback(ctx, playing); err != nil {
+		t.Fatalf("LogPlayback() playing A error = %v", err)
+	}
+
+	stopped := playing
+	stopped.RequestURL = "/emby/Sessions/Playing/Stopped"
+	stopped.OccurredAt = t0 + 10_000
+	stopped.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 100000, "IsPaused": false}`)
+	if err := store.LogPlayback(ctx, stopped); err != nil {
+		t.Fatalf("LogPlayback() stopped A error = %v", err)
+	}
+
+	// Reopening after the dedup window on server B must attribute the new play and its duration to B.
+	reopen := playing
+	reopen.OccurredAt = t0 + 16*60_000
+	reopen.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`)
++	store.SetServerName("B")
+	if err := store.LogPlayback(ctx, reopen); err != nil {
+		t.Fatalf("LogPlayback() playing B error = %v", err)
+	}
+
+	progressB := reopen
+	progressB.RequestURL = "/emby/Sessions/Playing/Progress"
+	progressB.OccurredAt = t0 + 16*60_000 + 15_000
+	progressB.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 150000, "IsPaused": false}`)
+	if err := store.LogPlayback(ctx, progressB); err != nil {
+		t.Fatalf("LogPlayback() progress B error = %v", err)
+	}
+
+	stats, err := store.GetPlayStats(ctx, 7)
+	if err != nil {
+		t.Fatalf("GetPlayStats() error = %v", err)
+	}
+	var millisA, millisB, playsA, playsB int64
+	for _, s := range stats {
+		if s.Node != "alpha" {
+			continue
+		}
+		if s.Server == "A" {
+			millisA += s.PlaybackMillis
+			playsA += s.Plays
+		}
+		if s.Server == "B" {
+			millisB += s.PlaybackMillis
+			playsB += s.Plays
+		}
+	}
+	if playsA != 1 || millisA != 10_000 || playsB != 1 || millisB != 15_000 {
+		t.Fatalf("A=(plays:%d, ms:%d) B=(plays:%d, ms:%d); want A=(1, 10000) B=(1, 15000)", playsA, millisA, playsB, millisB)
 	}
 }
