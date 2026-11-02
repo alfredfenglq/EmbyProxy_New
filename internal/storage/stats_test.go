@@ -1757,7 +1757,7 @@ func TestPlaybackReopenAfterStopAdoptsNewServer(t *testing.T) {
 		OccurredAt:  t0,
 		RequestBody: []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`),
 	}
-+	store.SetServerName("A")
+	store.SetServerName("A")
 	if err := store.LogPlayback(ctx, playing); err != nil {
 		t.Fatalf("LogPlayback() playing A error = %v", err)
 	}
@@ -1770,19 +1770,20 @@ func TestPlaybackReopenAfterStopAdoptsNewServer(t *testing.T) {
 		t.Fatalf("LogPlayback() stopped A error = %v", err)
 	}
 
-	// Reopening after the dedup window on server B must attribute the new play and its duration to B.
+	// Starting a new play on server B with the same PlaySessionId (same state key)
+	// after stopping must attribute both the new play and its duration to B.
 	reopen := playing
-	reopen.OccurredAt = t0 + 16*60_000
-	reopen.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`)
-+	store.SetServerName("B")
+	reopen.OccurredAt = t0 + 20_000
+	reopen.RequestBody = []byte(`{"ItemId": "2", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 0, "IsPaused": false}`)
+	store.SetServerName("B")
 	if err := store.LogPlayback(ctx, reopen); err != nil {
 		t.Fatalf("LogPlayback() playing B error = %v", err)
 	}
 
 	progressB := reopen
 	progressB.RequestURL = "/emby/Sessions/Playing/Progress"
-	progressB.OccurredAt = t0 + 16*60_000 + 15_000
-	progressB.RequestBody = []byte(`{"ItemId": "1", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 150000, "IsPaused": false}`)
+	progressB.OccurredAt = t0 + 35_000
+	progressB.RequestBody = []byte(`{"ItemId": "2", "SessionId": "session-1", "PlaySessionId": "play-session-1", "PositionTicks": 150000, "IsPaused": false}`)
 	if err := store.LogPlayback(ctx, progressB); err != nil {
 		t.Fatalf("LogPlayback() progress B error = %v", err)
 	}
