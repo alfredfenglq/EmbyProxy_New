@@ -119,10 +119,10 @@ func (s *Store) effectiveCacheTTL(sqliteFallback time.Duration) time.Duration {
 	return time.Duration(pgEnvInt("PG_CACHE_TTL_SECONDS", 60)) * time.Second
 }
 
-// ListPrefix reads all key/value pairs in [prefix, upperBound) in a single
-// indexed range query, avoiding N+1 round-trips on PostgreSQL.
-func (kv *KV) ListPrefix(ctx context.Context, prefix, upperBound string) (map[string]string, error) {
-	rows, err := kv.store.dbx().QueryContext(ctx, `SELECT k, v FROM proxy_kv WHERE k >= ? AND k < ? ORDER BY k`, prefix, upperBound)
+// ListPrefix reads all key/value pairs matching prefix in a single query,
+// avoiding N+1 round-trips while remaining safe under PostgreSQL UTF-8 collations.
+func (kv *KV) ListPrefix(ctx context.Context, prefix, _ string) (map[string]string, error) {
+	rows, err := kv.store.dbx().QueryContext(ctx, `SELECT k, v FROM proxy_kv WHERE k LIKE ? ORDER BY k`, prefix+"%")
 	if err != nil {
 		return nil, err
 	}
