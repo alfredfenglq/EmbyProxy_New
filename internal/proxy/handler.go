@@ -388,9 +388,20 @@ func (h *Handler) CleanupTTLMaps() {
 	}
 	if h.store != nil {
 		h.store.CleanupNodeCache()
-		_ = h.store.PrunePlayBuckets(context.Background(), 3)
-		_ = h.store.PrunePlaybackStates(context.Background(), 24*time.Hour)
 	}
+}
+
+// CleanupDatabase prunes expired historical rows. It is invoked only on the
+// elected leader node at a low frequency (default 60 minutes) to avoid
+// multi-node DELETE contention and autovacuum memory spikes.
+func (h *Handler) CleanupDatabase(ctx context.Context) {
+	if h.store == nil {
+		return
+	}
+	_ = h.store.PrunePlayBuckets(ctx, 3)
+	_ = h.store.PrunePlaybackStates(ctx, 24*time.Hour)
+	_ = h.store.PrunePlaySessions(ctx, 48*time.Hour)
+	_ = h.store.PrunePlayEvents(ctx, 48*time.Hour)
 }
 
 func (h *Handler) ResetNodeRoutingState(uid, name string) {

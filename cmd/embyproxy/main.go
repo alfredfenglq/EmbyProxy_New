@@ -88,7 +88,12 @@ func main() {
 	adminHandler := admin.New(cfg, store, checker, tg, log, proxyHandler.ResetNodeRoutingState, proxyHandler)
 
 	sched := scheduler.New(log, tg, proxyHandler.CleanupTTLMaps)
-	sched.SetInstanceHeartbeat(store, cfg.InstanceName, cfg.InstancePriority)
+	sched.SetDBCleanup(proxyHandler.CleanupDatabase)
+	if cfg.EnableSchedulerElection {
+		sched.SetInstanceHeartbeat(store, cfg.InstanceName, cfg.InstancePriority)
+	} else {
+		sched.SetNotificationsDisabled(true)
+	}
 	sched.Start(ctx)
 
 	mux := http.NewServeMux()

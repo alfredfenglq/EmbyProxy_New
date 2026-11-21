@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -110,16 +111,225 @@ func (s *Store) closePlaybackAsyncLogger() {
 	s.playbackWG.Wait()
 }
 
+type trafficStatKey struct {
+	day    string
+	node   string
+	client string
+	server string
+}
+
+type trafficBucketKey struct {
+	bucketStart int64
+	node        string
+	client      string
+}
+
+type trafficDelta struct {
+	totalBytes    int64
+	inboundBytes  int64
+	outboundBytes int64
+	updatedAt     int64
+}
+
+func (s *Store) trafficFlushInterval() time.Duration {
+	if s == nil || !s.pg {
+		return time.Second
+	}
+	return time.Duration(pgEnvInt("PLAYBACK_TRAFFIC_FLUSH_SECONDS", 5)) * time.Second
+}
+
+func (s *Store) accumulatePlaybackTraffic(in PlaybackInput, statsBatch map[trafficStatKey]*trafficDelta, bucketsBatch map[trafficBucketKey]*trafficDelta) {
+	if !in.IsPlayback {
+		return
+	}
+	now := playbackOccurredAt(in)
+	day := BeijingDate(now)
+	nodeName := strings.ToLower(strings.TrimSpace(in.Node.Name))
+	if nodeName == "" {
+		nodeName = "unknown"
+	}
+	server := s.ServerName()
+	method := strings.ToUpper(strings.TrimSpace(in.Method))
+	if method == "" {
+		method = strings.ToUpper(strings.TrimSpace(in.Headers.Get("method")))
+	}
+	if method == "" {
+		method = "GET"
+	}
+	if in.Mode != "proxy" || !playbackTrafficCountable(method, in.RequestURL) {
+		return
+	}
+	inboundBytes := in.InboundBytes
+	if inboundBytes < 0 {
+		inboundBytes = 0
+	}
+	outboundBytes := in.OutboundBytes
+	if outboundBytes < 0 {
+		outboundBytes = 0
+	}
+	if inboundBytes == 0 && outboundBytes == 0 {
+		return
+	}
+	totalBytes := inboundBytes + outboundBytes
+	client := cutString(in.Headers.Get("User-Agent"), 128)
+	if client == "" {
+		client = "Unknown"
+	}
+
+	sKey := trafficStatKey{day: day, node: nodeName, client: client, server: server}
+	if cur, ok := statsBatch[sKey]; ok {
+		cur.totalBytes += totalBytes
+		cur.inboundBytes += inboundBytes
+		cur.outboundBytes += outboundBytes
+		if now > cur.updatedAt {
+			cur.updatedAt = now
+		}
+	} else {
+		statsBatch[sKey] = &trafficDelta{
+			totalBytes:    totalBytes,
+			inboundBytes:  inboundBytes,
+			outboundBytes: outboundBytes,
+			updatedAt:     now,
+		}
+	}
+
+	bKey := trafficBucketKey{bucketStart: playbackBucketStart(now), node: nodeName, client: client}
+	if cur, ok := bucketsBatch[bKey]; ok {
+		cur.totalBytes += totalBytes
+		cur.inboundBytes += inboundBytes
+		cur.outboundBytes += outboundBytes
+		if now > cur.updatedAt {
+			cur.updatedAt = now
+		}
+	} else {
+		bucketsBatch[bKey] = &trafficDelta{
+			totalBytes:    totalBytes,
+			inboundBytes:  inboundBytes,
+			outboundBytes: outboundBytes,
+			updatedAt:     now,
+		}
+	}
+}
+
+func (s *Store) flushPlaybackTrafficBatch(ctx context.Context, statsBatch map[trafficStatKey]*trafficDelta, bucketsBatch map[trafficBucketKey]*trafficDelta) error {
+	tx, err := s.dbx().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if len(statsBatch) > 0 {
+		keys := make([]trafficStatKey, 0, len(statsBatch))
+		for k := range statsBatch {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].day != keys[j].day {
+				return keys[i].day < keys[j].day
+			}
+			if keys[i].node != keys[j].node {
+				return keys[i].node < keys[j].node
+			}
+			if keys[i].client != keys[j].client {
+				return keys[i].client < keys[j].client
+			}
+			return keys[i].server < keys[j].server
+		})
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO play_stats (day, node, client, server, plays, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES `)
+		args := make([]any, 0, len(keys)*8)
+		for i, k := range keys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("(?, ?, ?, ?, 0, ?, ?, ?, 0, 0, ?)")
+			d := statsBatch[k]
+			args = append(args, k.day, k.node, k.client, k.server, d.totalBytes, d.inboundBytes, d.outboundBytes, d.updatedAt)
+		}
+		sb.WriteString(` ON CONFLICT(day, node, client, server) DO UPDATE SET
+			bytes = play_stats.bytes + excluded.bytes,
+			inbound_bytes = play_stats.inbound_bytes + excluded.inbound_bytes,
+			outbound_bytes = play_stats.outbound_bytes + excluded.outbound_bytes,
+			updated_at = MAX(play_stats.updated_at, excluded.updated_at)`)
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
+	}
+
+	if len(bucketsBatch) > 0 {
+		keys := make([]trafficBucketKey, 0, len(bucketsBatch))
+		for k := range bucketsBatch {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].bucketStart != keys[j].bucketStart {
+				return keys[i].bucketStart < keys[j].bucketStart
+			}
+			if keys[i].node != keys[j].node {
+				return keys[i].node < keys[j].node
+			}
+			return keys[i].client < keys[j].client
+		})
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO play_buckets (bucket_start, node, client, mode, plays, playback_ms, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at) VALUES `)
+		args := make([]any, 0, len(keys)*8)
+		for i, k := range keys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("(?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 0, ?)")
+			d := bucketsBatch[k]
+			args = append(args, k.bucketStart, k.node, k.client, "proxy", d.totalBytes, d.inboundBytes, d.outboundBytes, d.updatedAt)
+		}
+		sb.WriteString(` ON CONFLICT(bucket_start, node, client, mode) DO UPDATE SET
+			bytes = play_buckets.bytes + excluded.bytes,
+			inbound_bytes = play_buckets.inbound_bytes + excluded.inbound_bytes,
+			outbound_bytes = play_buckets.outbound_bytes + excluded.outbound_bytes,
+			updated_at = MAX(play_buckets.updated_at, excluded.updated_at)`)
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) runPlaybackAsyncLogger() {
 	defer s.playbackWG.Done()
-	for in := range s.playbackQueue {
-		ctx, cancel := context.WithTimeout(context.Background(), playbackAsyncWriteTimeout)
-		if in.TrafficOnly {
-			_ = s.LogPlaybackTraffic(ctx, in)
-		} else {
-			_ = s.LogPlayback(ctx, in)
+	statsBatch := map[trafficStatKey]*trafficDelta{}
+	bucketsBatch := map[trafficBucketKey]*trafficDelta{}
+	flush := func() {
+		if len(statsBatch) == 0 && len(bucketsBatch) == 0 {
+			return
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), playbackAsyncWriteTimeout)
+		_ = s.flushPlaybackTrafficBatch(ctx, statsBatch, bucketsBatch)
 		cancel()
+		statsBatch = map[trafficStatKey]*trafficDelta{}
+		bucketsBatch = map[trafficBucketKey]*trafficDelta{}
+	}
+	ticker := time.NewTicker(s.trafficFlushInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case in, ok := <-s.playbackQueue:
+			if !ok {
+				flush()
+				return
+			}
+			if in.TrafficOnly {
+				s.accumulatePlaybackTraffic(in, statsBatch, bucketsBatch)
+				if len(statsBatch) >= 128 || len(bucketsBatch) >= 128 {
+					flush()
+				}
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), playbackAsyncWriteTimeout)
+			_ = s.LogPlayback(ctx, in)
+			cancel()
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 
@@ -1019,6 +1229,24 @@ func (s *Store) PrunePlayBuckets(ctx context.Context, keepDays int) error {
 	}
 	cutoff := playbackBucketStart(time.Now().AddDate(0, 0, -keepDays).UnixMilli())
 	_, err := s.dbx().ExecContext(ctx, `DELETE FROM play_buckets WHERE bucket_start < ?`, cutoff)
+	return err
+}
+
+func (s *Store) PrunePlaySessions(ctx context.Context, maxAge time.Duration) error {
+	if maxAge <= 0 {
+		maxAge = 48 * time.Hour
+	}
+	cutoff := time.Now().Add(-maxAge).UnixMilli()
+	_, err := s.dbx().ExecContext(ctx, `DELETE FROM play_sessions WHERE last_ts < ?`, cutoff)
+	return err
+}
+
+func (s *Store) PrunePlayEvents(ctx context.Context, maxAge time.Duration) error {
+	if maxAge <= 0 {
+		maxAge = 48 * time.Hour
+	}
+	cutoff := time.Now().Add(-maxAge).UnixMilli()
+	_, err := s.dbx().ExecContext(ctx, `DELETE FROM play_events WHERE last_ts < ?`, cutoff)
 	return err
 }
 

@@ -2,6 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"embyproxy/internal/logging"
@@ -10,16 +13,53 @@ import (
 )
 
 type Scheduler struct {
-	log              *logging.Logger
-	tg               *telegram.Service
-	cleanup          func()
-	store            *storage.Store
-	instanceName     string
-	instancePriority int
+	log                   *logging.Logger
+	tg                    *telegram.Service
+	cleanup               func()
+	dbCleanup             func(context.Context)
+	dbCleanupInterval     time.Duration
+	lastDBCleanup         time.Time
+	notificationsDisabled bool
+	store                 *storage.Store
+	instanceName          string
+	instancePriority      int
 }
 
 func New(log *logging.Logger, tg *telegram.Service, cleanup func()) *Scheduler {
-	return &Scheduler{log: log, tg: tg, cleanup: cleanup}
+	return &Scheduler{
+		log:               log,
+		tg:                tg,
+		cleanup:           cleanup,
+		dbCleanupInterval: schedulerDBPruneInterval(),
+	}
+}
+
+// SetDBCleanup registers the database pruning callback, which runs only on the
+// elected leader instance at dbCleanupInterval (default 60 minutes).
+func (s *Scheduler) SetDBCleanup(fn func(context.Context)) {
+	if s == nil {
+		return
+	}
+	s.dbCleanup = fn
+}
+
+// SetNotificationsDisabled disables leader election, notifications, and DB
+// pruning on pure edge proxy nodes while keeping local memory cleanup active.
+func (s *Scheduler) SetNotificationsDisabled(disabled bool) {
+	if s == nil {
+		return
+	}
+	s.notificationsDisabled = disabled
+}
+
+func schedulerDBPruneInterval() time.Duration {
+	v := strings.TrimSpace(os.Getenv("DB_PRUNE_INTERVAL_MINUTES"))
+	if v != "" {
+		if mins, err := strconv.Atoi(v); err == nil && mins > 0 {
+			return time.Duration(mins) * time.Minute
+		}
+	}
+	return 60 * time.Minute
 }
 
 // SetInstanceHeartbeat enables notification sender election for this
@@ -55,7 +95,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 			}
 		}
 	}()
-	if s.store != nil {
+	if s.store != nil && !s.notificationsDisabled {
 		go s.heartbeatLoop(ctx)
 	}
 }
@@ -97,7 +137,13 @@ func (s *Scheduler) writeHeartbeat(ctx context.Context) error {
 // election read failure it returns false: fail-closed, so a database
 // hiccup can delay notifications but can never duplicate them.
 func (s *Scheduler) shouldSendNotifications(ctx context.Context) bool {
-	if s == nil || s.store == nil {
+	if s == nil {
+		return true
+	}
+	if s.notificationsDisabled {
+		return false
+	}
+	if s.store == nil {
 		return true
 	}
 	heartbeats, err := ReadHeartbeats(ctx, s.store)
@@ -129,6 +175,17 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// deployment exactly one instance sends them.
 	if !s.shouldSendNotifications(ctx) {
 		return
+	}
+	if s.dbCleanup != nil && (s.lastDBCleanup.IsZero() || time.Since(s.lastDBCleanup) >= s.dbCleanupInterval) {
+		s.lastDBCleanup = time.Now()
+		func() {
+			defer func() {
+				if recover() != nil {
+					s.log.Error("scheduler", "db cleanup panic", map[string]any{"event": "dbCleanupPanic"})
+				}
+			}()
+			s.dbCleanup(ctx)
+		}()
 	}
 	if err := s.tg.CheckAndSendReport(ctx); err != nil {
 		s.log.Error("scheduler", "report error", map[string]any{"event": "reportError", "error": err.Error()})

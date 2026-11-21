@@ -31,6 +31,8 @@ type Store struct {
 	hostIndexCache    map[string]cacheEntry[map[string]HostMatch]
 	sysConfigCache    systemConfigCacheEntry
 	sysConfigGen      uint64
+	tgConfigCache     tgConfigCacheEntry
+	tgConfigGen       uint64
 	nodeCacheGen      uint64
 	playbackMu        sync.RWMutex
 	playbackClosed    bool
@@ -50,6 +52,12 @@ type Store struct {
 
 type KV struct {
 	store *Store
+}
+
+type tgConfigCacheEntry struct {
+	value TGConfig
+	ok    bool
+	exp   time.Time
 }
 
 type cacheEntry[T any] struct {
@@ -92,14 +100,62 @@ func NewWithDatabaseURL(dbPath, databaseURL string) (*Store, error) {
 	return newStore(dbPath, databaseURL)
 }
 
+func pgEnvInt(key string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func (s *Store) effectiveCacheTTL(sqliteFallback time.Duration) time.Duration {
+	if s == nil || !s.pg {
+		return sqliteFallback
+	}
+	return time.Duration(pgEnvInt("PG_CACHE_TTL_SECONDS", 60)) * time.Second
+}
+
+// ListPrefix reads all key/value pairs in [prefix, upperBound) in a single
+// indexed range query, avoiding N+1 round-trips on PostgreSQL.
+func (kv *KV) ListPrefix(ctx context.Context, prefix, upperBound string) (map[string]string, error) {
+	rows, err := kv.store.dbx().QueryContext(ctx, `SELECT k, v FROM proxy_kv WHERE k >= ? AND k < ? ORDER BY k`, prefix, upperBound)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func newStore(dbPath, databaseURL string) (*Store, error) {
 	if databaseURL != "" {
 		db, err := sql.Open("pgx", databaseURL)
 		if err != nil {
 			return nil, err
 		}
-		db.SetMaxOpenConns(postgresMaxOpenConns)
-		db.SetMaxIdleConns(postgresMaxIdleConns)
+		maxOpen := pgEnvInt("PG_MAX_OPEN_CONNS", 5)
+		maxIdle := pgEnvInt("PG_MAX_IDLE_CONNS", 2)
+		if maxIdle > maxOpen {
+			maxIdle = maxOpen
+		}
+		db.SetMaxOpenConns(maxOpen)
+		db.SetMaxIdleConns(maxIdle)
+		db.SetConnMaxIdleTime(time.Duration(pgEnvInt("PG_CONN_MAX_IDLE_SECONDS", 300)) * time.Second)
+		db.SetConnMaxLifetime(time.Duration(pgEnvInt("PG_CONN_MAX_LIFETIME_SECONDS", 1800)) * time.Second)
 		store := &Store{
 			db:                db,
 			pg:                true,
@@ -113,6 +169,8 @@ func newStore(dbPath, databaseURL string) (*Store, error) {
 			_ = db.Close()
 			return nil, err
 		}
+		_, _ = store.dbx().ExecContext(context.Background(), `CREATE INDEX IF NOT EXISTS idx_play_sessions_last_ts ON play_sessions(last_ts)`)
+		_, _ = store.dbx().ExecContext(context.Background(), `CREATE INDEX IF NOT EXISTS idx_play_events_last_ts ON play_events(last_ts)`)
 		store.startPlaybackAsyncLogger()
 		return store, nil
 	}
@@ -714,33 +772,19 @@ func (s *Store) ListNodes(ctx context.Context, uid string) ([]Node, error) {
 		return cloneNodes(nodes), nil
 	}
 	prefix := "u:" + uid + ":node:"
-	cursor := 0
-	nodes := []Node{}
-	for {
-		res, err := s.KV().List(ctx, prefix, cursor, 1000)
-		if err != nil {
-			return nil, err
+	entries, err := s.KV().ListPrefix(ctx, prefix, "u:"+uid+":node;")
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]Node, 0, len(entries))
+	for key, packed := range entries {
+		name := strings.TrimPrefix(key, prefix)
+		if node, valid := UnpackNode(name, packed); valid {
+			nodes = append(nodes, node)
 		}
-		for _, key := range res.Keys {
-			name := strings.TrimPrefix(key, prefix)
-			packed, ok, err := s.KV().Get(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				continue
-			}
-			if node, valid := UnpackNode(name, packed); valid {
-				nodes = append(nodes, node)
-			}
-		}
-		if res.ListComplete {
-			break
-		}
-		cursor = res.Cursor
 	}
 	SortNodes(nodes)
-	s.setListCache(cacheKey, cloneNodes(nodes), nodeCacheTTL)
+	s.setListCache(cacheKey, cloneNodes(nodes), s.effectiveCacheTTL(nodeCacheTTL))
 	return nodes, nil
 }
 
@@ -818,8 +862,22 @@ func (s *Store) GetHostIndex(ctx context.Context, uid string) (map[string]HostMa
 
 func (s *Store) GetTGConfig(ctx context.Context) (TGConfig, error) {
 	var cfg TGConfig
+	s.mu.RLock()
+	entry := s.tgConfigCache
+	gen := s.tgConfigGen
+	s.mu.RUnlock()
+	if !entry.exp.IsZero() && time.Now().Before(entry.exp) {
+		if entry.ok {
+			return entry.value, nil
+		}
+		return TGConfig{Enabled: false}, nil
+	}
+
 	value, ok, err := s.KV().Get(ctx, "tg:config")
 	if err != nil || !ok {
+		if err == nil {
+			s.setTGConfigCacheIfGen(gen, TGConfig{Enabled: false}, false, s.effectiveCacheTTL(systemConfigCacheTTL))
+		}
 		return TGConfig{Enabled: false}, err
 	}
 	var raw map[string]json.RawMessage
@@ -832,11 +890,28 @@ func (s *Store) GetTGConfig(ctx context.Context) (TGConfig, error) {
 	if _, ok := raw["reportEnabled"]; !ok && cfg.Enabled {
 		cfg.ReportEnabled = true
 	}
+	s.setTGConfigCacheIfGen(gen, cfg, true, s.effectiveCacheTTL(systemConfigCacheTTL))
 	return cfg, nil
 }
 
+func (s *Store) setTGConfigCacheIfGen(gen uint64, cfg TGConfig, ok bool, ttl time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tgConfigGen != gen {
+		return
+	}
+	s.tgConfigCache = tgConfigCacheEntry{value: cfg, ok: ok, exp: time.Now().Add(ttl)}
+}
+
 func (s *Store) SaveTGConfig(ctx context.Context, cfg TGConfig) error {
-	return s.KV().Put(ctx, "tg:config", cfg)
+	if err := s.KV().Put(ctx, "tg:config", cfg); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.tgConfigGen++
+	s.tgConfigCache = tgConfigCacheEntry{}
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *Store) GetSystemConfig(ctx context.Context, fallback SystemConfig) (SystemConfig, error) {
@@ -855,11 +930,11 @@ func (s *Store) GetSystemConfig(ctx context.Context, fallback SystemConfig) (Sys
 	ok, err := s.KV().GetJSON(ctx, "system:config", &cfg)
 	if err != nil || !ok {
 		if err == nil {
-			s.setSystemConfigCacheIfGen(gen, SystemConfig{}, false, systemConfigCacheTTL)
+			s.setSystemConfigCacheIfGen(gen, SystemConfig{}, false, s.effectiveCacheTTL(systemConfigCacheTTL))
 		}
 		return fallback, err
 	}
-	s.setSystemConfigCacheIfGen(gen, cfg, true, systemConfigCacheTTL)
+	s.setSystemConfigCacheIfGen(gen, cfg, true, s.effectiveCacheTTL(systemConfigCacheTTL))
 	return cfg, nil
 }
 

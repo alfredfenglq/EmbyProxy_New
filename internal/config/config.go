@@ -23,7 +23,8 @@ type Config struct {
 	DBPath           string
 	DatabaseURL      string
 	InstanceName     string
-	InstancePriority int
+	InstancePriority        int
+	EnableSchedulerElection bool
 	Port             int
 	AdminToken       string
 	Admin2FADisabled bool
@@ -56,7 +57,8 @@ func Load() (Config, error) {
 		DBPath:           envString("DB_PATH", filepath.Join(cwd, "data", "proxy.db")),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
 		InstanceName:     envString("INSTANCE_NAME", hostname),
-		InstancePriority: envInt("INSTANCE_PRIORITY", 100),
+		InstancePriority:        envInt("INSTANCE_PRIORITY", 100),
+		EnableSchedulerElection: envBool("ENABLE_SCHEDULER_ELECTION", true),
 		Port:             envInt("PORT", 8787),
 		AdminToken:       os.Getenv("ADMIN_TOKEN"),
 		Admin2FADisabled: envBool("ADMIN_2FA_DISABLED", false),

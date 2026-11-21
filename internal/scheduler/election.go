@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -67,30 +68,21 @@ func ElectSender(heartbeats map[string]Heartbeat, nowUnixMilli int64) string {
 	return best
 }
 
-// ReadHeartbeats reads every instance heartbeat from the store.
+// ReadHeartbeats reads every instance heartbeat from the store in a single
+// indexed prefix range query, avoiding N+1 round-trips on high-latency links.
 func ReadHeartbeats(ctx context.Context, store *storage.Store) (map[string]Heartbeat, error) {
-	out := map[string]Heartbeat{}
-	cursor := 0
-	for {
-		res, err := store.KV().List(ctx, heartbeatKeyPrefix, cursor, 1000)
-		if err != nil {
-			return nil, err
+	entries, err := store.KV().ListPrefix(ctx, heartbeatKeyPrefix, "instance:heartbeat;")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]Heartbeat, len(entries))
+	for key, raw := range entries {
+		name := strings.TrimPrefix(key, heartbeatKeyPrefix)
+		var hb Heartbeat
+		if err := json.Unmarshal([]byte(raw), &hb); err != nil {
+			continue
 		}
-		for _, key := range res.Keys {
-			name := strings.TrimPrefix(key, heartbeatKeyPrefix)
-			var hb Heartbeat
-			ok, err := store.KV().GetJSON(ctx, key, &hb)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				out[name] = hb
-			}
-		}
-		if res.ListComplete {
-			break
-		}
-		cursor = res.Cursor
+		out[name] = hb
 	}
 	return out, nil
 }
